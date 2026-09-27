@@ -1,0 +1,32 @@
+# env (never commit real keys; .env.example holds placeholders)
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# test and tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# alembic local runs
+*.log
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/tasks.json
+!.vscode/extensions.json
+.idea/

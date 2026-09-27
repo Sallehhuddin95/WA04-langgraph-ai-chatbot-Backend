@@ -48,9 +48,12 @@ Non-goals:
 
 | Intent | Meaning | Path |
 | --- | --- | --- |
-| `simple_chat` | greeting or small talk, no docs needed | router to generator, skip retrieval |
+| `simple_chat` | greeting, small talk, or opinion, no docs needed | router to direct answer, skip retrieval |
 | `rag_search` | fact question over docs | router to retriever to grader to generator |
 | `complex_task` | multi-step task needing docs plus planning | router to retriever to grader to generator with plan step |
+| vision turn | turn carries attached images | router to vision reply, skip retrieval |
+
+Per-turn model comes from the request (`model` field) with an env default. Router and grader stay on the cheap configured model. The generator uses the selected model: DeepSeek pair on chat completions, Muse on the Responses API. Only the vision model consumes images.
 
 Router input: current user text plus last 6 messages. Router output: one enum value. Default on low confidence: `rag_search`.
 
@@ -64,10 +67,11 @@ Router input: current user text plus last 6 messages. Router output: one enum va
 
 ### retriever
 
-- input: user text, `intent_category`
+- input: user text, `intent_category`, optional `prefetched_docs`
 - output: `retrieved_docs` (top k with chunk id, doc id, score, text)
 - k default: 5 for `rag_search`, 8 for `complex_task`, 0 for `simple_chat`
 - no LLM call
+- vector path: `DbChatService` prefetches top 8 via `prefetch_vector_docs` (embed query with `EMBEDDING_MODEL`, `ORDER BY embedding <=> :vec` on `document_chunks`). Retriever truncates prefetch to k. When embeddings are unavailable or the table is empty, it falls back to the keyword stub. No embedding endpoint is configured today, so live traffic still uses the stub.
 
 ### grader
 
@@ -89,9 +93,12 @@ Router input: current user text plus last 6 messages. Router output: one enum va
 
 ## Main Flow
 
-1. `POST /api/chat/threads/{thread_id}/turns` stores the user message.
+1. `POST /api/chat/threads/{thread_id}/turns` stores the user message with the selected model and attachment ids.
+2. Service loads the last 50 messages as history so every model sees the same thread. All turns answer as Singularity, one continuous assistant, regardless of the selected model. The model payload carries the last 30.
+3. Identity is a system fact, not retrieved content: every model call carries the Singularity persona (app chatbot named Singularity, never DeepSeek/Muse/another maker). No embeddings or RAG needed for identity questions.
 2. Router sets `intent_category`.
-3. If `simple_chat`, generator answers directly with `is_grounded=false`.
+3. If `simple_chat`, the model answers directly with `is_grounded=false` and no citations.
+4. If images are attached, the vision model answers about them directly with `is_grounded=false` and no citations.
 4. If `rag_search` or `complex_task`, retriever loads chunks.
 5. Generator drafts a reply from docs.
 6. Grader sets `is_grounded`.
@@ -99,17 +106,18 @@ Router input: current user text plus last 6 messages. Router output: one enum va
 
 ## Edge Conditions
 
-- `intent_category == simple_chat`: skip retriever and grader. Set `is_grounded=false`. Set `citations=[]`.
+- `intent_category == simple_chat`: skip retriever and grader. Answer directly with `is_grounded=false`. Set `citations=[]`.
 - `intent_category in (rag_search, complex_task)` and `is_grounded == true`: return reply with 1-n citations.
 - `is_grounded == false` and retries < 2: refetch docs, regenerate, regrade.
-- `is_grounded == false` and retries >= 2: return fallback. Set `is_grounded=false`. Set `citations=[]`.
-- empty retrieval: treat as `is_grounded=false`. Follow retry then fallback path.
+- `is_grounded == false` and retries >= 2: answer directly from model knowledge with `is_grounded=false` and `citations=[]`. The static fallback text is the last resort when no model key is set.
+- empty retrieval: treat as `is_grounded=false`. Follow retry then direct answer path.
 
 ## Retry and Fallback
 
 - max 2 grader retries per turn
 - retry changes the query or filter, not just the same call
-- fallback text states the answer is not grounded in docs and suggests a follow-up
+- after retries, the model answers directly and the reply is marked ungrounded with no citations
+- fallback text states the answer is not grounded in docs and suggests a follow-up; it only shows when no model key is set
 - fallback carries a new `trace_id` linked to the same turn
 - retry count and scores go to logs, not to the client
 
@@ -138,9 +146,9 @@ Router input: current user text plus last 6 messages. Router output: one enum va
 
 ## Acceptance Criteria
 
-- `simple_chat` skips retrieval and returns with no citations
+- `simple_chat` skips retrieval and returns a direct answer with no citations
 - `rag_search` with good docs returns `is_grounded=true` plus citations
-- 2 failed grades return fallback with `is_grounded=false`
+- 2 failed grades return a direct answer with `is_grounded=false`
 - resume after restart loads checkpoint and keeps history
 - cross-owner access returns 403
 - LLM outage returns 502 with safe shape and `trace_id`
