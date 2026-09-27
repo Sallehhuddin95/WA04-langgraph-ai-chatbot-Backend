@@ -8,7 +8,7 @@ Draft
 
 Store threads, messages, doc chunks, and graph checkpoints in one Postgres with Alembic control. Support owner checks, history paging, vector recall, and resume after restart.
 
-Related: `specs/features/chat-agent.md`, `specs/api/chat-api.md`, ADR 0006.
+Related: `specs/features/chat-agent.md`, `specs/api/chat-api.md`, ADR 0006, ADR 0009.
 
 ## Entities or Tables
 
@@ -45,18 +45,19 @@ Related: `specs/features/chat-agent.md`, `specs/api/chat-api.md`, ADR 0006.
 - `document_id: UUID NOT NULL`
 - `chunk_index: INT NOT NULL`
 - `text: TEXT NOT NULL`
-- `embedding: vector(1536) NOT NULL` (dim follows embedding model, record in migration)
+- `embedding: vector(1536) NOT NULL` (OpenAI text-embedding-3-small, dim 1536, locked per ADR 0009)
 - `meta: JSONB NOT NULL DEFAULT '{}'`
 - `created_at: TIMESTAMPTZ NOT NULL DEFAULT now()`
 
 ### checkpoints
 
-Managed by `langgraph-checkpoint-postgres`. Adapter owns access via `repositories/checkpoint_adapter.py`.
+Owned table `thread_checkpoints` (migration `0010`). Adapter owns access via `repositories/checkpoint_adapter.py`.
 
-- `thread_id: TEXT NOT NULL` (maps to app `threads.id` as text)
-- `checkpoint_id: TEXT NOT NULL`
-- `parent_id: TEXT NULL`
-- `state: BYTEA or JSONB per lib version`
+- `thread_id: UUID NOT NULL`, no FK to `threads.id`
+- `trace_id: UUID NULL`
+- `intent_category: VARCHAR(32) NULL`
+- `is_grounded: BOOL NULL`
+- `state: JSONB NOT NULL`
 - `created_at: TIMESTAMPTZ NOT NULL`
 
 ## Relationships
@@ -72,13 +73,13 @@ Managed by `langgraph-checkpoint-postgres`. Adapter owns access via `repositorie
 - `document_chunks` unique: `(document_id, chunk_index)`
 - `messages` unique: `(owner scope idempotency)` via partial unique on `(thread_id, idempotency_key)` where key not null
 - `threads.owner_id` never null, never client-set
-- vector column uses `USING hnsw` or `ivfflat` per ops note; keep recall and build time in migration comment
+- vector column uses `USING hnsw` with cosine distance (`<=>`); locked per ADR 0009
 
 ## Query or Access Notes
 
 - owner read: `WHERE id = :id AND owner_id = :user_id`, 403 on miss with valid session and existing id
 - history page: `WHERE thread_id = :id ORDER BY created_at ASC, id ASC LIMIT :limit`, cursor is `(created_at, id)`
-- vector recall: `ORDER BY embedding <=> :query_vec LIMIT :k`, filter by doc scope before order when needed
+- vector recall: `ORDER BY embedding <=> :query_vec LIMIT :k`, default k is 5, filter by doc scope before order when needed
 - resume: adapter loads latest checkpoint by `thread_id`, graph restores `ChatState`
 - idempotent turn: lookup `(thread_id, idempotency_key)` before graph run
 
@@ -89,24 +90,25 @@ Indexes:
 - `messages(trace_id)`
 - `messages(thread_id, idempotency_key)` partial where key not null
 - `document_chunks(document_id, chunk_index)`
-- `document_chunks` vector index on `embedding`
+- `document_chunks` HNSW index on `embedding` for cosine distance (`<=>`)
 - checkpoint index on `(thread_id, created_at DESC)`
 
 ## Migration Notes
 
 Alembic plan:
 
-1. `0001` extensions: `pgcrypto` or `pgcrypto` alt plus `vector`
+1. `0001` extensions: `pgcrypto` only (`vector` lives in `0003`)
 2. `0002` `threads` plus `messages` with FKs and checks
-3. `0003` `document_chunks` with vector column and indexes
-4. `0004` checkpoint tables via lib SQL, wrapped in one migration with prefix `ckpt_`
+3. `0003` `vector` extension plus `document_chunks` with vector column and indexes (needs pgvector on host)
+4. `0004` placeholder for lib checkpoint tables (no-op, kept for history)
+5. `0010` `thread_checkpoints` owned resume table with `(thread_id, created_at DESC)` index
 5. later dims or index type changes get their own migration with reindex step
 
 Rules:
 
 - one concern per migration
 - reversible where practical, with explicit data loss note when not
-- record embedding dim and distance op in migration message
+- record embedding model (text-embedding-3-small), dim 1536, and distance op `<=>` in migration message
 - keep app code and schema compatible in deploy order per `docs/backend/migrations.md`
 
 Retention:
